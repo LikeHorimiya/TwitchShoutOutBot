@@ -1,0 +1,144 @@
+name: Publish Release
+
+# privateリポジトリの build.yml から cross-repo dispatch で呼び出される。
+# 手動トリガーも可（緊急再実行用）。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v1.0.0)'
+        required: true
+      run_id:
+        description: 'GitHub Actions run_id of the private build job'
+        required: true
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: 'false'
+      llama_tag:
+        description: 'llama.cpp tag (informational)'
+        required: false
+        default: ''
+      src_sha:
+        description: 'Source commit SHA (informational)'
+        required: false
+        default: ''
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. privateリポジトリのartifactをダウンロード ─────────────────
+      #   GitHub API でアーティファクト一覧を取得し、installer ZIP を DL する。
+      #   RELEASE_PAT: TwitchBotCpp(private) の Actions=Read 権限が必要。
+      - name: Download artifact from private repo
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+          PRIVATE_REPO: ${{ github.repository_owner }}/TwitchBotCpp
+          RUN_ID: ${{ inputs.run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching artifact list for run_id=${RUN_ID} ..."
+          ARTIFACTS=$(curl -fsSL \
+            -H "Authorization: Bearer ${RELEASE_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/actions/runs/${RUN_ID}/artifacts")
+
+          echo "Artifact list:"
+          echo "${ARTIFACTS}" | jq -r '.artifacts[] | "\(.id)  \(.name)"'
+
+          # "TwitchBot-<version>-installer" という名前のアーティファクトを取得
+          ARTIFACT_ID=$(echo "${ARTIFACTS}" | jq -r \
+            --arg ver "${VERSION}" \
+            '.artifacts[] | select(.name | test("TwitchBot-.*-installer")) | .id' \
+            | head -1)
+
+          if [ -z "${ARTIFACT_ID}" ]; then
+            echo "ERROR: No installer artifact found in run ${RUN_ID}"
+            exit 1
+          fi
+          echo "Artifact ID: ${ARTIFACT_ID}"
+
+          # GitHub API は artifact を zip-wrapped で返す（中身が dist/TwitchBot-*.exe）
+          curl -fsSL \
+            -H "Authorization: Bearer ${RELEASE_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -o artifact_wrapper.zip
+
+          echo "Downloaded artifact_wrapper.zip: $(du -h artifact_wrapper.zip | cut -f1)"
+
+      # ── 2. installer EXE を取り出す ──────────────────────────────────
+      - name: Extract installer
+        run: |
+          set -euo pipefail
+          unzip -o artifact_wrapper.zip
+          echo "=== Extracted files ==="
+          ls -lh TwitchBot-*.exe
+
+          # ファイル名を環境変数に保存
+          SETUP_EXE=$(ls TwitchBot-*.exe | head -1)
+          echo "SETUP_EXE=${SETUP_EXE}" >> "$GITHUB_ENV"
+          echo "Installer: ${SETUP_EXE}"
+
+      # ── 3. SHA-256 チェックサムを生成（リリースノートに記載） ─────────
+      - name: Generate SHA-256
+        run: |
+          set -euo pipefail
+          SHA256=$(sha256sum "${SETUP_EXE}" | awk '{print $1}')
+          echo "SHA256=${SHA256}" >> "$GITHUB_ENV"
+          echo "SHA-256: ${SHA256}  ${SETUP_EXE}"
+
+      # ── 4. publicリポジトリに GitHub Release を作成 ──────────────────
+      #   GITHUB_TOKEN はこのリポジトリ（TwitchBot-releases）の自動トークン。
+      #   Contents=Write 権限があれば tag 作成・release 作成が可能。
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: TwitchBot ${{ inputs.version }}
+          files: ${{ env.SETUP_EXE }}
+          prerelease: ${{ inputs.prerelease == 'true' }}
+          body: |
+            llama.cpp: ${{ inputs.llama_tag }}
+
+            **インストール方法**
+            `TwitchBot-x.x.x-setup.exe` を実行 → インストール先を選択 → 完了後 `TwitchBot.exe` を起動
+
+            **インストール先の構成**
+            ```
+            {インストール先}\
+              TwitchBot.exe
+              libcrypto-3-x64.dll / libssl-3-x64.dll
+              licenses.txt / README.txt / checksums.txt
+              llama\  (llama-server + 依存DLL)
+              model\  (GGUFモデルをここに配置)
+            ```
+
+            **SHA-256**
+            ```
+            ${{ env.SHA256 }}  ${{ env.SETUP_EXE }}
+            ```
+
+            **Windows SmartScreen / Smart App Control について**
+            署名なし配布のため初回実行時に警告が出ることがあります。
+
+            方法1: インストーラーを右クリック → プロパティ → 「許可する」にチェック → OK
+            方法2: PowerShell で `Unblock-File -Path .\${{ env.SETUP_EXE }}`
+
+            **アンインストール**
+            コントロールパネル → プログラムのアンインストール → TwitchBot
+            ※ model フォルダはアンインストール時に削除されません
+
+            ---
+            <details>
+            <summary>Build info</summary>
+
+            - Source SHA: ${{ inputs.src_sha }}
+            - Private run_id: ${{ inputs.run_id }}
+            </details>
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
