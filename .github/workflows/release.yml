@@ -35,7 +35,7 @@ jobs:
       - name: Download artifact from private repo
         env:
           RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
-          PRIVATE_REPO: ${{ github.repository_owner }}/TwitchBotCpp
+          PRIVATE_REPO: ${{ github.repository_owner }}/TwitchAutoShoutOutBot
           RUN_ID: ${{ inputs.run_id }}
           VERSION: ${{ inputs.version }}
         run: |
